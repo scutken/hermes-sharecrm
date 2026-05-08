@@ -116,10 +116,20 @@ class ShareCRMAdapter(BasePlatformAdapter):
 
         extra = getattr(config, "extra", {}) or {}
 
-        self.app_id = os.getenv("SHARECRM_APP_ID") or extra.get("app_id", "")
-        self.app_secret = os.getenv("SHARECRM_APP_SECRET") or extra.get("app_secret", "")
+        # Accept both SHARECRM_* (new) and FXIAOKE_* (legacy) env vars
+        self.app_id = (
+            os.getenv("SHARECRM_APP_ID")
+            or os.getenv("FXIAOKE_APP_ID")
+            or extra.get("app_id", "")
+        )
+        self.app_secret = (
+            os.getenv("SHARECRM_APP_SECRET")
+            or os.getenv("FXIAOKE_APP_SECRET")
+            or extra.get("app_secret", "")
+        )
         self.base_url = (
             os.getenv("SHARECRM_BASE_URL")
+            or os.getenv("FXIAOKE_BASE_URL")
             or extra.get("base_url", DEFAULT_BASE_URL)
         ).rstrip("/")
 
@@ -634,16 +644,16 @@ class ShareCRMAdapter(BasePlatformAdapter):
 
 def check_requirements() -> bool:
     """Check if ShareCRM is minimally configured."""
-    app_id = os.getenv("SHARECRM_APP_ID", "")
-    app_secret = os.getenv("SHARECRM_APP_SECRET", "")
+    app_id = os.getenv("SHARECRM_APP_ID") or os.getenv("FXIAOKE_APP_ID", "")
+    app_secret = os.getenv("SHARECRM_APP_SECRET") or os.getenv("FXIAOKE_APP_SECRET", "")
     return bool(app_id and app_secret)
 
 
 def validate_config(config) -> bool:
     """Validate that the platform config has enough info to connect."""
     extra = getattr(config, "extra", {}) or {}
-    app_id = os.getenv("SHARECRM_APP_ID") or extra.get("app_id", "")
-    app_secret = os.getenv("SHARECRM_APP_SECRET") or extra.get("app_secret", "")
+    app_id = os.getenv("SHARECRM_APP_ID") or os.getenv("FXIAOKE_APP_ID") or extra.get("app_id", "")
+    app_secret = os.getenv("SHARECRM_APP_SECRET") or os.getenv("FXIAOKE_APP_SECRET") or extra.get("app_secret", "")
     return bool(app_id and app_secret)
 
 
@@ -720,15 +730,15 @@ def interactive_setup() -> None:
 def is_connected(config) -> bool:
     """Check whether ShareCRM is configured (env or config.yaml)."""
     extra = getattr(config, "extra", {}) or {}
-    app_id = os.getenv("SHARECRM_APP_ID") or extra.get("app_id", "")
-    app_secret = os.getenv("SHARECRM_APP_SECRET") or extra.get("app_secret", "")
+    app_id = os.getenv("SHARECRM_APP_ID") or os.getenv("FXIAOKE_APP_ID") or extra.get("app_id", "")
+    app_secret = os.getenv("SHARECRM_APP_SECRET") or os.getenv("FXIAOKE_APP_SECRET") or extra.get("app_secret", "")
     return bool(app_id and app_secret)
 
 
 def _env_enablement() -> dict | None:
     """Seed PlatformConfig.extra from env vars during gateway config load."""
-    app_id = os.getenv("SHARECRM_APP_ID", "").strip()
-    app_secret = os.getenv("SHARECRM_APP_SECRET", "").strip()
+    app_id = (os.getenv("SHARECRM_APP_ID") or os.getenv("FXIAOKE_APP_ID", "")).strip()
+    app_secret = (os.getenv("SHARECRM_APP_SECRET") or os.getenv("FXIAOKE_APP_SECRET", "")).strip()
     if not (app_id and app_secret):
         return None
 

@@ -181,6 +181,15 @@ class ShareCRMAdapter(BasePlatformAdapter):
                 logger.error("ShareCRM: SSE connection error — %s", e)
                 await self._wait(delay)
                 delay = min(delay * 2, 60)
+            except Exception as e:
+                # Server may close the SSE stream after max_lifetime (~60s).
+                # Treat as normal — just reconnect, don't log as error.
+                if not str(e):
+                    logger.debug("ShareCRM: SSE stream ended, reconnecting")
+                else:
+                    logger.error("ShareCRM: SSE unexpected error — %s", e)
+                await self._wait(delay)
+                delay = min(delay * 2, 60)
 
     async def _read_stream(self, resp) -> None:
         ev_type = ev_id = data = ""

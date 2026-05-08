@@ -441,12 +441,13 @@ class ShareCRMAdapter(BasePlatformAdapter):
         chat_type = msg_data.get("chat_type", "direct")
         sender = msg_data.get("from", {})
         raw_user_id = sender.get("id", "")
-        # Construct full sender ID: E.<ea>.<id> (e.g. E.fs.8017)
-        # The API only returns the numeric ID in from.id; from.name is
-        # the last segment of senderFullId. We compose the full ID from
-        # the ea field + from.id so the gateway allowlist matches correctly.
+        # Construct full sender ID if needed: E.<ea>.<id> (e.g. E.fs.8017)
+        # The API may return just the numeric ID or the full ID; handle both.
         ea = msg_data.get("ea", "")
-        user_id = f"E.{ea}.{raw_user_id}" if ea and raw_user_id else raw_user_id
+        if raw_user_id and not raw_user_id.startswith("E."):
+            user_id = f"E.{ea}.{raw_user_id}" if ea else raw_user_id
+        else:
+            user_id = raw_user_id
         user_name = sender.get("name", raw_user_id)
 
         # Extract text content

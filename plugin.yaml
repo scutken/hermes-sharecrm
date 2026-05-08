@@ -1,0 +1,36 @@
+name: sharecrm-platform
+label: 纷享销客 ShareCRM
+kind: platform
+version: 1.0.0
+description: >
+  纷享销客 (ShareCRM) 企信 IM Gateway adapter for Hermes Agent.
+  通过 SSE 长连接接收企信消息，通过 HTTP API 发送回复。
+  连接 ShareCRM IM Gateway (https://open.fxiaoke.com/im-gateway)。
+  SSE events: connected, message, reset. 支持群聊历史消息上下文注入。
+author: Hermes Agent
+requires_env:
+  - name: SHARECRM_APP_ID
+    description: "ShareCRM IM Gateway 接入应用 ID (appId)"
+    prompt: "ShareCRM App ID"
+    password: false
+  - name: SHARECRM_APP_SECRET
+    description: "ShareCRM IM Gateway 接入密钥 (appSecret)"
+    prompt: "ShareCRM App Secret"
+    password: true
+  - name: SHARECRM_BASE_URL
+    description: "ShareCRM IM Gateway 基础域名 (默认 https://open.fxiaoke.com)"
+    prompt: "ShareCRM Base URL"
+    password: false
+optional_env:
+  - name: SHARECRM_ALLOWED_USERS
+    description: "逗号分隔的允许用户 ID 列表"
+    prompt: "Allowed user IDs (comma-separated)"
+    password: false
+  - name: SHARECRM_ALLOW_ALL_USERS
+    description: "允许所有用户与 Bot 交互 (开发测试用)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: SHARECRM_HOME_CHANNEL
+    description: "Cron / 通知投递的默认 chat_id"
+    prompt: "Home channel chat_id (可选)"
+    password: false

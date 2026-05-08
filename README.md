@@ -174,12 +174,58 @@ ShareCRM IM Gateway (https://open.fxiaoke.com)
 
 ### 用户鉴权
 
-```bash
-# 仅允许指定用户
-hermes config set SHARECRM_ALLOWED_USERS=7618,9001
+ShareCRM 插件的用户鉴权由 Hermes Gateway 统一处理，无需在 adapter 中额外配置。
+Gateway 提供了**配对码 (Pairing)** 机制：未授权用户发送消息时，会自动回复一个配对码。
 
-# 或允许所有用户（dev 模式）
+#### 快速放开（开发/测试）
+
+```bash
+# 允许所有用户（dev 模式，生产环境不建议）
 hermes config set SHARECRM_ALLOW_ALL_USERS=true
+hermes gateway restart
+```
+
+#### 按用户 ID 放开
+
+ShareCRM 的完整用户 ID 格式为 `E.{ea}.{id}`，例如 `E.fs.8017`。
+从 Gateway 日志中可以看到被拒绝用户的完整 ID：
+
+```
+WARNING gateway.run: Unauthorized user: E.fs.8017 (8017) on sharecrm
+```
+
+取 `E.fs.8017` 部分，配置到允许列表：
+
+```bash
+# 单个用户
+hermes config set SHARECRM_ALLOWED_USERS=E.fs.8017
+
+# 多个用户（逗号分隔）
+hermes config set SHARECRM_ALLOWED_USERS=E.fs.8017,E.fs.9001
+
+hermes gateway restart
+```
+
+#### 用户自助配对
+
+未授权用户向 Bot 发消息时，Gateway 会自动回复：
+```
+Hi~ I don't recognize you yet!
+Here's your pairing code: `XXXXXX`
+Ask the bot owner to run:
+`hermes pairing approve sharecrm XXXXXX`
+```
+
+管理员执行配对批准后，用户即可交互，无需重启 Gateway：
+
+```bash
+hermes pairing approve sharecrm <配对码>
+```
+
+#### 查询已授权用户
+
+```bash
+hermes pairing list sharecrm
 ```
 
 ### Cron 投递
@@ -224,7 +270,9 @@ hermes-sharecrm/
 
 **Q: 群聊中 Bot 不响应？**
 
-检查 `SHARECRM_ALLOWED_USERS` 是否正确配置，或尝试 `SHARECRM_ALLOW_ALL_USERS=true`。
+首先确认 Gateway 日志中是否有 `Unauthorized user` 警告。如果有，按上文「用户鉴权」章节配置允许列表。注意 ShareCRM 的用户 ID 格式为 `E.fs.XXXX` 而非纯数字。
+
+如果日志中没有认证警告，检查 SSE 连接是否正常：`hermes gateway status` 确认 sharecrm 平台状态为 connected。
 
 **Q: 消息中出现 `**` 乱码？**
 

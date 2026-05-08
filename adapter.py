@@ -133,11 +133,9 @@ class ShareCRMAdapter(BasePlatformAdapter):
             or extra.get("base_url", DEFAULT_BASE_URL)
         ).rstrip("/")
 
-        # Auth
-        self.allowed_users: list = extra.get("allowed_users", [])
-        self._allowed_users_set: set = set(
-            str(u) for u in self.allowed_users if u
-        )
+        # Auth is handled by the gateway runner's _is_user_authorized(),
+        # not by the adapter. The allowed_users_env in register() tells
+        # the gateway which env var to check.
 
         max_msg = extra.get("max_message_length", 4096)
         self.max_message_length = int(max_msg)
@@ -442,8 +440,14 @@ class ShareCRMAdapter(BasePlatformAdapter):
         chat_id = msg_data.get("chat_id", "")
         chat_type = msg_data.get("chat_type", "direct")
         sender = msg_data.get("from", {})
-        user_id = sender.get("id", "")
-        user_name = sender.get("name", user_id)
+        raw_user_id = sender.get("id", "")
+        # Construct full sender ID: E.<ea>.<id> (e.g. E.fs.8017)
+        # The API only returns the numeric ID in from.id; from.name is
+        # the last segment of senderFullId. We compose the full ID from
+        # the ea field + from.id so the gateway allowlist matches correctly.
+        ea = msg_data.get("ea", "")
+        user_id = f"E.{ea}.{raw_user_id}" if ea and raw_user_id else raw_user_id
+        user_name = sender.get("name", raw_user_id)
 
         # Extract text content
         text = msg_data.get("message", {}).get("content", "")
@@ -473,12 +477,10 @@ class ShareCRMAdapter(BasePlatformAdapter):
                     reply_to_text = hmsg.get("content", "")
                     break
 
-        # Auth check
-        if self._allowed_users_set and user_id not in self._allowed_users_set:
-            logger.debug(
-                "ShareCRM: ignoring message from unauthorized user %s", user_id
-            )
-            return
+        # Note: user authorization is handled by the gateway runner's
+        # _is_user_authorized(), which also provides the pairing flow
+        # for unauthorized users. The adapter should NOT duplicate auth
+        # checks here — doing so would bypass the pairing mechanism.
 
         # Build source
         source = self.build_source(

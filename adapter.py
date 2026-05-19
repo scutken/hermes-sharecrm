@@ -248,6 +248,20 @@ class ShareCRMAdapter(BasePlatformAdapter):
         message_id = d.get("message_id", "")
         reply_to_id = d.get("reply_message_id")
 
+        # Intercept /sethome command to manually set the home channel env var.
+        # This ensures the gateway's "No home channel" check passes immediately
+        # without relying on .env reload or gateway command dispatch.
+        if text.strip() == "/sethome":
+            env_key = "SHARECRM_HOME_CHANNEL"
+            os.environ[env_key] = chat_id
+            try:
+                from hermes_cli.setup import save_env_value
+                save_env_value(env_key, chat_id)
+            except Exception:
+                pass
+            await self.send(chat_id, f"已将当前会话 {chat_id} 设置为 Home Channel。")
+            return
+
         history = d.get("history_messages", [])
         if history:
             ctx = ["[Recent chat context:]"]

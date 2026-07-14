@@ -74,7 +74,7 @@ class ShareCRMAdapter(BasePlatformAdapter):
 
     # ── connect / disconnect ────────────────────────────────────────────
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False, **kwargs) -> bool:
         if not aiohttp:
             self._set_fatal_error("missing_deps", "pip install aiohttp", retryable=False)
             return False

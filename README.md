@@ -18,7 +18,7 @@ pip install aiohttp
 SHARECRM_APP_ID=bot-xxxxxxxxxxxxxxxx
 SHARECRM_APP_SECRET=your_secret_here
 
-# 可选 — 默认 https://open.fxiaoke.com
+# 可选 — Dashboard 可配；留空则使用 https://open.fxiaoke.com
 SHARECRM_BASE_URL=https://open.fxiaoke.com
 
 # 用户鉴权（至少配一种）

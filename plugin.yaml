@@ -1,7 +1,7 @@
 name: sharecrm-platform
 label: 纷享销客 ShareCRM
 kind: platform
-version: 1.0.0
+version: 1.1.8
 description: 纷享销客企信 IM Gateway 插件 for Hermes Agent
 author: scutken
 requires_env:
@@ -15,18 +15,18 @@ requires_env:
     password: true
 optional_env:
   - name: SHARECRM_BASE_URL
-    description: "接口地址（默认 https://open.fxiaoke.com）"
-    prompt: "Base URL"
+    description: "接口地址，留空则使用 https://open.fxiaoke.com"
+    prompt: "Base URL (https://open.fxiaoke.com)"
     password: false
   - name: SHARECRM_ALLOWED_USERS
-    description: "允许的用户 ID，逗号分隔（如 E.fs.8017）"
+    description: "允许的用户 ID，逗号分隔（如 E.82846.1230）。留空则私聊走 pairing"
     prompt: "Allowed users"
     password: false
   - name: SHARECRM_ALLOW_ALL_USERS
-    description: "设为 true 允许所有用户（开发用）"
-    prompt: "Allow all?"
+    description: "设为 true 允许所有用户（仅开发测试）"
+    prompt: "Allow all users (true/false)"
     password: false
   - name: SHARECRM_HOME_CHANNEL
-    description: "定时通知投递目标 chat_id"
+    description: "定时通知投递目标 chat_id；也可在会话里发 /sethome"
     prompt: "Home channel"
     password: false

@@ -280,7 +280,7 @@ class ParserTests(unittest.IsolatedAsyncioTestCase):
         await a._handle_message(payload)
         self.assertEqual(a.handle_message.await_count, 1)
 
-    async def test_history_uses_channel_context_not_text(self):
+    async def test_group_history_uses_channel_context_with_header(self):
         a = _make_adapter()
         captured = {}
 
@@ -292,22 +292,66 @@ class ParserTests(unittest.IsolatedAsyncioTestCase):
         a._do_send = mock.AsyncMock(return_value={"success": True})
         a._home_channel_set = lambda: True
         payload = {"type": "message", "data": {
-            "message_id": "m2", "chat_id": "0:fs:s:", "chat_type": "direct",
+            "message_id": "m2", "chat_id": "0:fs:grp:", "chat_type": "group",
             "from": {"id": "8017", "name": "n"}, "ea": "fs",
             "message": {"type": "text", "content": "现在几点"},
             "reply_message_id": 111,
             "history_messages": [
-                {"message_id": "111", "content": "你好", "full_sender_id": "E.fs.9001"},
-                {"message_id": "222", "content": "在吗", "sender_id": "E.fs.8017"},
+                {"message_id": "111", "content": "你好", "full_sender_id": "E.fs.9001", "message_timestamp": 1000},
+                {"message_id": "222", "content": "在吗", "sender_id": "E.fs.8017", "message_timestamp": 2000},
             ],
         }}
         await a._handle_message(payload)
         event = captured["event"]
         self.assertEqual(event.text, "现在几点")
-        self.assertIn("9001: 你好", event.channel_context)
-        self.assertIn("8017: 在吗", event.channel_context)
+        self.assertTrue(event.channel_context.startswith(adapter.HISTORY_HEADER))
+        self.assertIn("[9001] 你好", event.channel_context)
+        self.assertIn("[8017] 在吗", event.channel_context)
         self.assertNotIn("现在几点", event.channel_context or "")
         self.assertEqual(event.reply_to_text, "你好")
+
+    async def test_dm_does_not_inject_history(self):
+        a = _make_adapter()
+        captured = {}
+
+        async def _capture(event):
+            captured["event"] = event
+
+        a.handle_message = _capture
+        a._stage_images = mock.AsyncMock(return_value=[])
+        a._do_send = mock.AsyncMock(return_value={"success": True})
+        a._home_channel_set = lambda: True
+        payload = {"type": "message", "data": {
+            "message_id": "dm1", "chat_id": "0:fs:dm:", "chat_type": "direct",
+            "from": {"id": "8017", "name": "n"}, "ea": "fs",
+            "message": {"type": "text", "content": "hi"},
+            "history_messages": [
+                {"message_id": "h1", "content": "旧消息", "sender_id": "E.fs.1", "message_timestamp": 1000},
+            ],
+        }}
+        await a._handle_message(payload)
+        self.assertIsNone(captured["event"].channel_context)
+
+    async def test_history_delta_respects_watermark(self):
+        a = _make_adapter()
+        a._last_self_ts["0:fs:grp:"] = 2000
+        history = [
+            {"message_id": "old", "content": "旧的", "sender_id": "E.fs.1", "message_timestamp": 1000},
+            {"message_id": "new", "content": "新的", "sender_id": "E.fs.2", "message_timestamp": 3000},
+        ]
+        text = a._format_history(history, since_ms=2000)
+        self.assertIn("新的", text)
+        self.assertNotIn("旧的", text)
+
+    async def test_format_history_skips_entries_without_timestamp(self):
+        a = _make_adapter()
+        history = [
+            {"message_id": "x", "content": "无时间戳", "sender_id": "E.fs.1"},
+            {"message_id": "y", "content": "有时间戳", "sender_id": "E.fs.2", "message_timestamp": 1},
+        ]
+        text = a._format_history(history)
+        self.assertIn("有时间戳", text)
+        self.assertNotIn("无时间戳", text)
 
     async def test_image_only_marks_photo(self):
         a = _make_adapter()
@@ -330,17 +374,103 @@ class ParserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.message_type, MessageType.PHOTO)
         self.assertEqual(event.media_urls, ["/tmp/x.png"])
 
-    async def test_get_chat_info(self):
+    async def test_get_chat_info_unseen_is_dm_fallback(self):
         a = _make_adapter()
-        self.assertEqual((await a.get_chat_info("0:fs:s:"))["type"], "direct")
-        self.assertEqual((await a.get_chat_info("0:fs:s:p"))["type"], "group")
+        info = await a.get_chat_info("0:fs:abcdef1234567890:")
+        self.assertEqual(info["type"], "dm")
+        self.assertEqual(info["name"], "abcdef12")
+        self.assertEqual(info["chat_id"], "0:fs:abcdef1234567890:")
+
+    async def test_dm_chat_name_uses_sender_name(self):
+        a = _make_adapter()
+        captured = {}
+
+        async def _capture(event):
+            captured["event"] = event
+
+        a.handle_message = _capture
+        a._stage_images = mock.AsyncMock(return_value=[])
+        a._do_send = mock.AsyncMock(return_value={"success": True})
+        a._home_channel_set = lambda: True
+        payload = {"type": "message", "data": {
+            "message_id": "d1", "chat_id": "0:fs:dm123:", "chat_type": "direct",
+            "from": {"id": "8017", "name": "张三"}, "ea": "fs",
+            "message": {"type": "text", "content": "hi"},
+        }}
+        await a._handle_message(payload)
+        self.assertEqual(captured["event"].source.chat_name, "私聊 张三")
+        info = await a.get_chat_info("0:fs:dm123:")
+        self.assertEqual(info["type"], "dm")
+        self.assertEqual(info["name"], "私聊 张三")
+
+    async def test_dm_chat_name_falls_back_to_user_id(self):
+        a = _make_adapter()
+        captured = {}
+
+        async def _capture(event):
+            captured["event"] = event
+
+        a.handle_message = _capture
+        a._stage_images = mock.AsyncMock(return_value=[])
+        a._do_send = mock.AsyncMock(return_value={"success": True})
+        a._home_channel_set = lambda: True
+        payload = {"type": "message", "data": {
+            "message_id": "d2", "chat_id": "0:fs:dm456:", "chat_type": "direct",
+            "from": {"id": "8017", "name": ""}, "ea": "fs",
+            "message": {"type": "text", "content": "hi"},
+        }}
+        await a._handle_message(payload)
+        self.assertEqual(captured["event"].source.chat_name, "私聊 E.fs.8017")
+
+    async def test_group_chat_name_is_readable(self):
+        a = _make_adapter()
+        captured = {}
+
+        async def _capture(event):
+            captured["event"] = event
+
+        a.handle_message = _capture
+        a._stage_images = mock.AsyncMock(return_value=[])
+        a._do_send = mock.AsyncMock(return_value={"success": True})
+        a._home_channel_set = lambda: True
+        payload = {"type": "message", "data": {
+            "message_id": "g1", "chat_id": "0:fs:d3058fc2e0cb4d389c91b9c33b09658f:", "chat_type": "group",
+            "from": {"id": "8017", "name": "李四"}, "ea": "fs",
+            "message": {"type": "text", "content": "hi"},
+        }}
+        await a._handle_message(payload)
+        self.assertEqual(captured["event"].source.chat_name, "群聊 d3058fc2")
+        self.assertEqual(captured["event"].source.chat_type, "group")
+        info = await a.get_chat_info("0:fs:d3058fc2e0cb4d389c91b9c33b09658f:")
+        self.assertEqual(info["type"], "group")
+        self.assertEqual(info["name"], "群聊 d3058fc2")
+
+    async def test_chat_name_cache_is_bounded(self):
+        a = _make_adapter()
+        for i in range(adapter.CHAT_NAME_CACHE_MAX + 20):
+            a._remember_chat(f"0:fs:{i}:", f"name{i}", "dm")
+        self.assertLessEqual(len(a._chat_meta), adapter.CHAT_NAME_CACHE_MAX)
+        self.assertNotIn("0:fs:0:", a._chat_meta)
 
     async def test_format_history_limits(self):
         a = _make_adapter()
-        history = [{"content": f"c{i}", "sender_id": "E.fs.1"} for i in range(50)]
+        history = [
+            {"content": f"c{i}", "sender_id": "E.fs.1", "message_timestamp": i}
+            for i in range(50)
+        ]
         text = a._format_history(history)
-        self.assertLessEqual(len(text), adapter.HISTORY_MAX_CHARS)
+        self.assertLessEqual(len(text), adapter.HISTORY_MAX_CHARS + len(adapter.HISTORY_HEADER) + 1)
         self.assertIn("c49", text)
+        self.assertTrue(text.startswith(adapter.HISTORY_HEADER))
+
+    async def test_send_updates_self_watermark(self):
+        a = _make_adapter()
+        a._client_session = object()
+        a._ensure_token = mock.AsyncMock(return_value=True)
+        with mock.patch.object(adapter, "_post_text", mock.AsyncMock(return_value=(True, "m1", 0, ""))):
+            result = await a._do_send("0:fs:grp:", "hi")
+        self.assertTrue(result["success"])
+        self.assertGreater(a._last_self_ts.get("0:fs:grp:", 0), 0)
 
 
 class HttpTests(unittest.IsolatedAsyncioTestCase):

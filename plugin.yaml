@@ -1,7 +1,7 @@
 name: sharecrm-platform
 label: 纷享销客 ShareCRM
 kind: platform
-version: 1.2.0
+version: 1.2.1
 description: 纷享销客企信 IM Gateway 插件 for Hermes Agent
 author: scutken
 homepage: https://github.com/scutken/hermes-sharecrm

@@ -92,9 +92,25 @@ hermes gateway restart
 - 通过 `media_urls` 传给 Agent，供视觉能力读取；
 - 对图片 URL 做 SSRF 校验（拒绝内网/回环地址）。
 
+### 会话名（chat_name）
+
+ShareCRM 的 `chat_id` 是不透明 uuid（`{env}:{ea}:{sessionId}:{parent}`），直接显示很难认。插件会把会话名规范化后再交给 Gateway：
+
+- 私聊：`私聊 <发送者显示名>`，名称为空时退化到完整 user_id
+- 群聊：API 不提供群名，用短 session 段（如 `群聊 d3058fc2`）
+- `get_chat_info()` 返回 `type` 为 `dm` / `group`，符合 Hermes 约定（用于 handoff 判定 / 会话列表显示）
+
+> 注意：这只影响 session 列表、channel directory 等**显示名**，不影响会话**标题**（标题由 Hermes 从用户首条消息自动生成）。
+
 ### 历史消息上下文
 
-群聊的 `history_messages` 会通过 `MessageEvent.channel_context` 注入，由 Gateway 在触发消息之前拼接，不会污染本轮正文，也不会和会话自身的 transcript 重复。可用 `SHARECRM_INCLUDE_HISTORY=false` 关闭。
+群聊的 `history_messages` 通过官方 `MessageEvent.channel_context` 注入，遵循 Hermes 各渠道的通行做法：
+
+- **只对群聊注入**，私聊跳过（私聊每条都触发，无需 backfill）；
+- **只注入增量**：以本插件在该会话最近一条出站消息为水位（watermark），只注入此后的新消息，避免每轮重发整窗口、transcript 重复累积；
+- 渲染成 `[Recent channel messages]` + `[发送者] 内容`，限 12 条 / 4000 字。
+
+可用 `SHARECRM_INCLUDE_HISTORY=false` 完全关闭。水位是内存态，Gateway 重启后会重新注入一次当前窗口（与 Discord 冷启动行为一致）。
 
 ### 定时任务 / 进程外投递
 

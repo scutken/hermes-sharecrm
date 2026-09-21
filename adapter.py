@@ -99,7 +99,10 @@ MAX_INBOUND_IMAGES = 8
 MAX_INBOUND_IMAGE_BYTES = 10 * 1024 * 1024
 HISTORY_LIMIT = 12
 HISTORY_MAX_CHARS = 4000
+HISTORY_HEADER = "[Recent channel messages]"
 BOT_RECONNECT_WAIT_SECONDS = 10.0
+# 会话名缓存上限（chat_id -> {name, type}）：只用于显示，超出丢最早条目
+CHAT_NAME_CACHE_MAX = 500
 
 
 def _coerce_int(value: Any, default: int) -> int:
@@ -234,6 +237,12 @@ class ShareCRMAdapter(BasePlatformAdapter):
         self._dedup = MessageDeduplicator()
         # 官方 cache helper 不可用时写下的临时图片，disconnect 时清理
         self._temp_files: set = set()
+        # 会话可读名缓存（chat_id -> {"name","type"}）：sharecrm 的 chat_id 是不透明
+        # uuid，会话列表/handoff 需要可读名；只存显示信息，有界。
+        self._chat_meta: Dict[str, Dict[str, Any]] = {}
+        # history 增量水位：chat_id -> 本插件最近一条出站消息的时间戳(ms)。
+        # 只注入「自己上次发言之后」的群聊历史，避免每轮重发整窗口导致 transcript 重复累积。
+        self._last_self_ts: Dict[str, float] = {}
 
     @property
     def name(self) -> str:
@@ -483,6 +492,9 @@ class ShareCRMAdapter(BasePlatformAdapter):
         ea = d.get("ea", "")
         user_id = raw_id if raw_id.startswith("E.") else (f"E.{ea}.{raw_id}" if ea and raw_id else raw_id)
         user_name = sender.get("name", raw_id)
+        # chat_id 是不透明 uuid，换成可读名再交给 gateway（session 列表/handoff 用）
+        chat_name = self._resolve_chat_name(chat_id, chat_type, user_name, user_id)
+        self._remember_chat(chat_id, chat_name, chat_type)
 
         msg = d.get("message") or {}
         caption = (msg.get("content") or "").strip() or (d.get("text") or "")
@@ -491,6 +503,16 @@ class ShareCRMAdapter(BasePlatformAdapter):
         text = "\n".join(part for part in [caption, *image_lines] if part)
         reply_to_id = d.get("reply_message_id")
         history = d.get("history_messages") or []
+
+        # 历史上下文（官方 channel_context 路径）：
+        # - 只在非私聊注入（私聊每条都触发，无需 backfill；对齐 Discord/Slack/Relay）
+        # - 只注入「自己上次发言之后」的增量（watermark），避免每轮重发整窗口
+        # - 必须在发 ACK 之前取水位，否则 ACK 会把自己刚推进的时间戳当成水位
+        channel_context = ""
+        if self.include_history and chat_type != "dm":
+            since_ms = self._last_self_ts.get(chat_id)
+            channel_context = self._format_history(history, since_ms=since_ms)
+        reply_text = self._find_reply_text(history, reply_to_id)
 
         # 拦截 /sethome，用官方 persist_home_channel 落库（不再直写 os.environ）
         if caption.strip() == "/sethome":
@@ -508,13 +530,8 @@ class ShareCRMAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.debug("ShareCRM: ack send failed: %s", exc)
 
-        # 历史消息用 MessageEvent.channel_context 传入：由 gateway 在触发消息之前拼接，
-        # 不污染本轮 text，也不会和会话自身的 transcript 重复注入。
-        channel_context = self._format_history(history) if self.include_history else ""
-        reply_text = self._find_reply_text(history, reply_to_id)
-
         source = self.build_source(
-            chat_id=chat_id, chat_name=chat_id, chat_type=chat_type,
+            chat_id=chat_id, chat_name=chat_name, chat_type=chat_type,
             user_id=user_id, user_name=user_name,
         )
         event_kwargs: Dict[str, Any] = {
@@ -566,23 +583,39 @@ class ShareCRMAdapter(BasePlatformAdapter):
             return "?"
         return value.rsplit(".", 1)[-1] if value.startswith("E.") else value
 
-    def _format_history(self, history: List[Any]) -> str:
-        """把 history_messages 整理成紧凑上下文；保留最近 N 条、限制总长。"""
+    def _format_history(self, history: List[Any], *, since_ms: Optional[float] = None) -> str:
+        """把 history_messages 整理成官方风格的只读上下文块。
+
+        - 只保留 `message_timestamp` 晚于 ``since_ms``（本插件上次出站时间）的增量
+        - 按时间升序，取最近 ``HISTORY_LIMIT`` 条，限总长
+        - 渲染为 ``[Recent channel messages]`` + ``[sender] content``
+        没有可用增量时返回 ""（channel_context 保持未设置）。
+        """
         if not history:
             return ""
-        lines: List[str] = []
-        for item in history[-HISTORY_LIMIT:]:
+        rows: List[Tuple[float, str, str]] = []
+        for item in history:
             if not isinstance(item, dict):
+                continue
+            try:
+                ts = float(item.get("message_timestamp"))
+            except (TypeError, ValueError):
+                continue  # 无时间戳无法做增量/排序，跳过
+            if since_ms is not None and ts <= since_ms:
                 continue
             content = str(item.get("content") or "").strip()
             if not content:
                 continue
             sender = self._short_sender(str(item.get("full_sender_id") or item.get("sender_id") or ""))
-            lines.append(f"{sender}: {content}")
-        if not lines:
+            rows.append((ts, sender, content))
+        if not rows:
             return ""
+        rows.sort(key=lambda row: row[0])
+        lines = [f"[{sender}] {content}" for _ts, sender, content in rows[-HISTORY_LIMIT:]]
         text = "\n".join(lines)
-        return text[-HISTORY_MAX_CHARS:] if len(text) > HISTORY_MAX_CHARS else text
+        if len(text) > HISTORY_MAX_CHARS:
+            text = text[-HISTORY_MAX_CHARS:]
+        return f"{HISTORY_HEADER}\n{text}"
 
     @staticmethod
     def _find_reply_text(history: List[Any], reply_to_id: Any) -> Optional[str]:
@@ -701,6 +734,8 @@ class ShareCRMAdapter(BasePlatformAdapter):
             self._client_session, self.base_url, self._access_token or "", chat_id, text, reply_to
         )
         if ok:
+            # 记录自己最近一条出站消息时间，作为下次 group history 的增量水位
+            self._remember_self_ts(chat_id)
             return {"success": True, "message_id": message_id or ""}
 
         if code in (ERR_TOKEN_INVALID, ERR_TOKEN_EXPIRED) and allow_retry:
@@ -736,7 +771,8 @@ class ShareCRMAdapter(BasePlatformAdapter):
         try:
             from gateway.config import HomeChannel, persist_home_channel
 
-            home = HomeChannel(platform=self.platform, chat_id=chat_id, name=chat_id)
+            name = (self._chat_meta.get(chat_id) or {}).get("name") or chat_id
+            home = HomeChannel(platform=self.platform, chat_id=chat_id, name=name)
             persist_home_channel(home, enabled_if_new=True)
             try:
                 self.config.home_channel = home
@@ -745,9 +781,61 @@ class ShareCRMAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("ShareCRM: persist home channel failed: %s", exc)
 
+    # ── chat naming ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _short_chat_id(chat_id: str) -> str:
+        """从 `{env}:{ea}:{sessionId}:{parent}` 取可读的短会话段。"""
+        parts = str(chat_id or "").split(":")
+        session = parts[2] if len(parts) >= 3 else ""
+        return (session or str(chat_id or ""))[:8]
+
+    def _resolve_chat_name(self, chat_id: str, chat_type: str, user_name: str, user_id: str) -> str:
+        """给会话一个可读名。
+
+        ShareCRM 的 chat_id 是不透明 uuid，会话列表/handoff 直接显示会很难认：
+        - 私聊：``私聊 <发送者显示名>``，退化到 user_id
+        - 群聊：API 不提供群名，用 ``群聊 <短 session 段>``
+        """
+        if chat_type == "dm":
+            name = str(user_name or "").strip()
+            if not name or name == chat_id:
+                name = str(user_id or chat_id)
+            return f"私聊 {name}" if name else chat_id
+        short = self._short_chat_id(chat_id)
+        return f"群聊 {short}" if short else chat_id
+
+    def _remember_chat(self, chat_id: str, name: str, chat_type: str) -> None:
+        """记录 chat_id 的显示名与类型，供 get_chat_info / handoff 使用（有界）。"""
+        if not chat_id:
+            return
+        self._chat_meta[chat_id] = {"name": name or chat_id, "type": chat_type or "dm"}
+        overflow = len(self._chat_meta) - CHAT_NAME_CACHE_MAX
+        if overflow > 0:
+            for key in list(self._chat_meta.keys())[:overflow]:
+                self._chat_meta.pop(key, None)
+
+    def _remember_self_ts(self, chat_id: str) -> None:
+        """记录本插件在该会话最近一条出站消息的时间戳(ms)，作为 history 增量水位（有界）。"""
+        if not chat_id:
+            return
+        self._last_self_ts[chat_id] = time.time() * 1000.0
+        overflow = len(self._last_self_ts) - CHAT_NAME_CACHE_MAX
+        if overflow > 0:
+            for key in list(self._last_self_ts.keys())[:overflow]:
+                self._last_self_ts.pop(key, None)
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
-        is_direct = chat_id.count(":") >= 3 and chat_id.split(":")[3] == ""
-        return {"name": chat_id, "type": "direct" if is_direct else "group", "chat_id": chat_id}
+        """返回 {name, type, chat_id}；type 遵循 Hermes 约定（dm/group/channel）。"""
+        meta = self._chat_meta.get(chat_id)
+        if meta:
+            return {
+                "name": meta.get("name") or chat_id,
+                "type": meta.get("type") or "dm",
+                "chat_id": chat_id,
+            }
+        # 没见过该会话：chat_id 无法区分 dm/group，按最常见的私聊兜底，名字用短段。
+        return {"name": self._short_chat_id(chat_id), "type": "dm", "chat_id": chat_id}
 
 
 # ── plugin hooks ────────────────────────────────────────────────────────

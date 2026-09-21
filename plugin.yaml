@@ -1,7 +1,7 @@
 name: sharecrm-platform
 label: 纷享销客 ShareCRM
 kind: platform
-version: 1.2.1
+version: 1.2.2
 description: 纷享销客企信 IM Gateway 插件 for Hermes Agent
 author: scutken
 homepage: https://github.com/scutken/hermes-sharecrm
@@ -32,6 +32,10 @@ optional_env:
   - name: SHARECRM_INCLUDE_HISTORY
     description: "是否把群聊 history_messages 作为上下文注入，默认 true"
     prompt: "Include history (true/false)"
+    password: false
+  - name: SHARECRM_MENTION_NAMES
+    description: "群聊 @机器人 的显示名，逗号分隔（如 二哈）；用于剥掉命令前缀，让 @二哈 /new 生效"
+    prompt: "Bot mention names"
     password: false
   - name: SHARECRM_ALLOWED_USERS
     description: "允许的用户 ID，逗号分隔（如 E.82846.1230）。留空则私聊走 pairing"

@@ -353,6 +353,97 @@ class ParserTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("有时间戳", text)
         self.assertNotIn("无时间戳", text)
 
+    async def test_format_history_excludes_bot_messages(self):
+        a = _make_adapter()
+        history = [
+            {"message_id": "b", "content": "机器人回复", "full_sender_id": "BOT.2140.82846_abc", "message_timestamp": 1},
+            {"message_id": "u", "content": "用户消息", "sender_id": "E.fs.1", "message_timestamp": 2},
+        ]
+        text = a._format_history(history)
+        self.assertIn("用户消息", text)
+        self.assertNotIn("机器人回复", text)
+
+    def test_strip_mention_generic(self):
+        a = _make_adapter()
+        self.assertEqual(a._strip_mention("@二哈 /new"), "/new")
+        self.assertEqual(a._strip_mention("/new @二哈"), "/new")
+        self.assertEqual(a._strip_mention("@二哈 /new @二哈"), "/new")
+        self.assertEqual(a._strip_mention("@二哈 你好 @二哈"), "你好")
+        self.assertEqual(a._strip_mention("hello @二哈"), "hello")
+        self.assertEqual(a._strip_mention("你好 @某人 吗"), "你好 @某人 吗")  # 未配置名字时中间不动
+        self.assertEqual(a._strip_mention("@二哈"), "@二哈")
+        self.assertEqual(a._strip_mention("@file:xxx"), "@file:xxx")
+        self.assertEqual(a._strip_mention("普通消息"), "普通消息")
+        self.assertEqual(a._strip_mention("＠二哈 /reset"), "/reset")
+
+    def test_strip_mention_configured_names(self):
+        a = _make_adapter({"mention_names": "二哈,小 助手"})
+        self.assertEqual(a._strip_mention("@小 助手 /new"), "/new")
+        self.assertEqual(a._strip_mention("@二哈 /new"), "/new")
+        self.assertEqual(a._strip_mention("/new @二哈"), "/new")
+        self.assertEqual(a._strip_mention("你好 @二哈 帮我看"), "你好 帮我看")
+        self.assertEqual(a._strip_mention("@二哈 你好 @二哈"), "你好")
+        self.assertEqual(a._strip_mention("@二哈"), "@二哈")
+        self.assertEqual(a._strip_mention("＠二哈 /reset"), "/reset")
+
+    async def test_group_mention_is_stripped_before_event(self):
+        a = _make_adapter()
+        captured = {}
+
+        async def _capture(event):
+            captured["event"] = event
+
+        a.handle_message = _capture
+        a._stage_images = mock.AsyncMock(return_value=[])
+        a._do_send = mock.AsyncMock(return_value={"success": True})
+        a._home_channel_set = lambda: True
+        payload = {"type": "message", "data": {
+            "message_id": "g9", "chat_id": "0:fs:grp:", "chat_type": "group",
+            "from": {"id": "8017", "name": "张三"}, "ea": "fs",
+            "message": {"type": "text", "content": "@二哈 /new"},
+        }}
+        await a._handle_message(payload)
+        self.assertEqual(captured["event"].text, "/new")
+        self.assertTrue(captured["event"].is_command())
+
+    async def test_group_trailing_mention_stripped(self):
+        a = _make_adapter()
+        captured = {}
+
+        async def _capture(event):
+            captured["event"] = event
+
+        a.handle_message = _capture
+        a._stage_images = mock.AsyncMock(return_value=[])
+        a._do_send = mock.AsyncMock(return_value={"success": True})
+        a._home_channel_set = lambda: True
+        payload = {"type": "message", "data": {
+            "message_id": "g10", "chat_id": "0:fs:grp:", "chat_type": "group",
+            "from": {"id": "8017", "name": "张三"}, "ea": "fs",
+            "message": {"type": "text", "content": "/new @二哈"},
+        }}
+        await a._handle_message(payload)
+        self.assertEqual(captured["event"].text, "/new")
+
+    async def test_dm_mention_is_not_stripped(self):
+        a = _make_adapter()
+        captured = {}
+
+        async def _capture(event):
+            captured["event"] = event
+
+        a.handle_message = _capture
+        a._stage_images = mock.AsyncMock(return_value=[])
+        a._do_send = mock.AsyncMock(return_value={"success": True})
+        a._home_channel_set = lambda: True
+        payload = {"type": "message", "data": {
+            "message_id": "d9", "chat_id": "0:fs:dm:", "chat_type": "direct",
+            "from": {"id": "8017", "name": "张三"}, "ea": "fs",
+            "message": {"type": "text", "content": "@二哈 /new"},
+        }}
+        await a._handle_message(payload)
+        self.assertEqual(captured["event"].text, "@二哈 /new")
+
     async def test_image_only_marks_photo(self):
         a = _make_adapter()
         captured = {}

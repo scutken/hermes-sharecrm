@@ -220,6 +220,12 @@ class ShareCRMAdapter(BasePlatformAdapter):
         # base 的分片逻辑读类属性 MAX_MESSAGE_LENGTH；实例属性可覆盖以支持配置。
         self.MAX_MESSAGE_LENGTH = self.max_message_length
         self.include_history = bool(_extra_or_secret(extra, "include_history", "SHARECRM_INCLUDE_HISTORY", True))
+        # 群聊 @机器人 的显示名（逗号分隔），用于剥掉命令前缀；留空则按通用 "@token" 兜底
+        self.mention_names = [
+            n.strip().lstrip("@＠")
+            for n in str(_extra_or_secret(extra, "mention_names", "SHARECRM_MENTION_NAMES", "") or "").split(",")
+            if n.strip().lstrip("@＠")
+        ]
 
         self._access_token: Optional[str] = None
         self._token_expires_at: float = 0.0
@@ -498,6 +504,10 @@ class ShareCRMAdapter(BasePlatformAdapter):
 
         msg = d.get("message") or {}
         caption = (msg.get("content") or "").strip() or (d.get("text") or "")
+        # 企信群聊必须 @ 机器人，文本形如 "@二哈 /new"；剥掉开头提及，
+        # 否则 /new、/reset 等命令不在 char 0，gateway 识别不到。私聊不处理。
+        if chat_type != "dm":
+            caption = self._strip_mention(caption)
         staged = await self._stage_images(msg.get("images") or [])
         image_lines = [f"![{name}]({path})" for path, name in staged]
         text = "\n".join(part for part in [caption, *image_lines] if part)
@@ -583,6 +593,59 @@ class ShareCRMAdapter(BasePlatformAdapter):
             return "?"
         return value.rsplit(".", 1)[-1] if value.startswith("E.") else value
 
+    @staticmethod
+    def _is_mention_boundary(ch: str) -> bool:
+        """提及 token 的结束边界：空白、结尾或常见标点。"""
+        return not ch or ch.isspace() or ch in ",.;:!?，。；：！？、()（）[]【】{}<>\"'“”‘’"
+
+    @classmethod
+    def _remove_mention_token(cls, text: str, token: str) -> str:
+        """删除所有作为独立 token 出现的 ``@名字``（后接边界/结尾），避免误伤 ``@名字xyz``。"""
+        if not text or not token:
+            return text
+        out: List[str] = []
+        i, m, n = 0, len(text), len(token)
+        while i < m:
+            if text.startswith(token, i) and cls._is_mention_boundary(text[i + n] if i + n < m else ""):
+                out.append(" ")
+                i += n
+                continue
+            out.append(text[i])
+            i += 1
+        return "".join(out)
+
+    @staticmethod
+    def _collapse_ws(text: str) -> str:
+        """折叠空白：行内多空格/制表符压成单个空格，去首尾空白，保留换行。"""
+        return "\n".join(" ".join(line.split()) for line in text.split("\n")).strip()
+
+    def _strip_mention(self, text: str) -> str:
+        """去掉群聊里的 @机器人（开头/结尾/中间都处理），让 ``@二哈 /new`` 这类命令生效。
+
+        - 配置了 ``SHARECRM_MENTION_NAMES``：删除所有 ``@<名字>`` 出现处（最长名优先，避免短名误吃长名）
+        - 未配置：只剥掉首/尾的通用 ``@token``，不动中间（避免误删 @其他同事）
+        - 剥完为空（消息只有 @机器人）时保持原样
+        """
+        if not text or ("@" not in text and "＠" not in text):
+            return text
+        if self.mention_names:
+            result = text
+            for name in sorted(self.mention_names, key=len, reverse=True):
+                for prefix in ("@", "＠"):
+                    result = self._remove_mention_token(result, prefix + name)
+            return self._collapse_ws(result) or text
+        # 未配置名字：只处理首尾 token，中间的原样保留
+        tokens = text.split()
+        n = len(tokens)
+        start, end = 0, n
+        while start < end and tokens[start].startswith(("@", "＠")) and len(tokens[start]) > 1:
+            start += 1
+        while end > start and tokens[end - 1].startswith(("@", "＠")) and len(tokens[end - 1]) > 1:
+            end -= 1
+        if start == 0 and end == n:
+            return text
+        return self._collapse_ws(" ".join(tokens[start:end])) or text
+
     def _format_history(self, history: List[Any], *, since_ms: Optional[float] = None) -> str:
         """把 history_messages 整理成官方风格的只读上下文块。
 
@@ -606,7 +669,10 @@ class ShareCRMAdapter(BasePlatformAdapter):
             content = str(item.get("content") or "").strip()
             if not content:
                 continue
-            sender = self._short_sender(str(item.get("full_sender_id") or item.get("sender_id") or ""))
+            sender_raw = str(item.get("full_sender_id") or item.get("sender_id") or "")
+            if sender_raw.startswith("BOT."):
+                continue  # 机器人自己嘅回复已在 transcript，勿当历史重复注入
+            sender = self._short_sender(sender_raw)
             rows.append((ts, sender, content))
         if not rows:
             return ""
@@ -870,6 +936,7 @@ _ENV_SEED_SPEC = (
     ("SHARECRM_BASE_URL", "base_url", None),
     ("SHARECRM_SSE_VERSION", "sse_version", None),
     ("SHARECRM_MAX_MESSAGE_LENGTH", "max_message_length", _coerce_int),
+    ("SHARECRM_MENTION_NAMES", "mention_names", None),
 )
 
 # YAML → env 桥：(yaml_key, ENV_VAR, kind)
@@ -879,6 +946,7 @@ _YAML_SPEC = (
     ("base_url", "SHARECRM_BASE_URL", "str"),
     ("sse_version", "SHARECRM_SSE_VERSION", "str"),
     ("max_message_length", "SHARECRM_MAX_MESSAGE_LENGTH", "str"),
+    ("mention_names", "SHARECRM_MENTION_NAMES", "str"),
     ("allowed_users", "SHARECRM_ALLOWED_USERS", "csv"),
     ("allow_all_users", "SHARECRM_ALLOW_ALL_USERS", "lower"),
     ("home_channel", "SHARECRM_HOME_CHANNEL", "str"),
@@ -971,6 +1039,12 @@ _DASHBOARD_ENV = (
         "description": "是否把群聊 history_messages 作为上下文注入，默认 true",
         "prompt": "Include history (true/false)",
         "help": "false 时不注入历史消息上下文。",
+    },
+    {
+        "name": "SHARECRM_MENTION_NAMES",
+        "description": "群聊 @机器人 的显示名，逗号分隔（如 二哈）。用于剥掉命令前缀，让 @二哈 /new 生效",
+        "prompt": "Bot mention names",
+        "help": "留空则按通用 @token 兜底剥离。",
     },
     {
         "name": "SHARECRM_ALLOWED_USERS",

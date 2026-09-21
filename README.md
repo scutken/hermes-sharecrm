@@ -102,6 +102,23 @@ ShareCRM 的 `chat_id` 是不透明 uuid（`{env}:{ea}:{sessionId}:{parent}`）�
 
 > 注意：这只影响 session 列表、channel directory 等**显示名**，不影响会话**标题**（标题由 Hermes 从用户首条消息自动生成）。
 
+### 群聊命令（@机器人）
+
+企信群聊必须 @机器人 才会把消息下发给 Bot，文本形如 `@二哈 /new`。插件会自动去掉 `@机器人`（**开头、结尾、中间都处理**），让 slash 命令（`/new`、`/reset`、`/title`、`/compress`、`/stop` 等）正常识别：
+
+```
+@二哈 /new            → /new
+/new @二哈            → /new
+@二哈 你好 @二哈       → 你好
+@二哈 /title 项目讨论  → /title 项目讨论
+```
+
+- 配置 `SHARECRM_MENTION_NAMES`（逗号分隔，如 `二哈,小助手`）后，会**删除所有位置**的 `@名字`；
+- 未配置时只剥掉**首/尾**的通用 `@token`，不动中间（避免误删 @其他同事）；
+- 私聊不处理（私聊无需 @）。
+
+> 群聊默认按用户隔离会话（Hermes `group_sessions_per_user=true`），所以 `/new` 只重开**你自己**在该群的会话。
+
 ### 历史消息上下文
 
 群聊的 `history_messages` 通过官方 `MessageEvent.channel_context` 注入，遵循 Hermes 各渠道的通行做法：
@@ -176,6 +193,7 @@ hermes pairing approve sharecrm <配对码>
 | `SHARECRM_SSE_VERSION` | 否 | SSE 协议版本，默认 `1.4.0` |
 | `SHARECRM_MAX_MESSAGE_LENGTH` | 否 | 单条消息最大长度，默认 `4096` |
 | `SHARECRM_INCLUDE_HISTORY` | 否 | 是否注入群聊历史，默认 `true` |
+| `SHARECRM_MENTION_NAMES` | 否 | 群聊 @机器人 的显示名（逗号分隔），用于剥掉命令前缀 |
 | `SHARECRM_ALLOWED_USERS` | 否 | 允许的用户 ID，逗号分隔 |
 | `SHARECRM_ALLOW_ALL_USERS` | 否 | 设为 `true` 允许所有人 |
 | `SHARECRM_HOME_CHANNEL` | 否 | 定时通知投递的 chat_id；也可在会话里发 `/sethome` |

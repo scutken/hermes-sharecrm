@@ -1,9 +1,12 @@
 name: sharecrm-platform
 label: 纷享销客 ShareCRM
 kind: platform
-version: 1.1.8
+version: 1.2.0
 description: 纷享销客企信 IM Gateway 插件 for Hermes Agent
 author: scutken
+homepage: https://github.com/scutken/hermes-sharecrm
+license: MIT
+tags: [messaging, sharecrm, fxiaoke, qixin]
 requires_env:
   - name: SHARECRM_APP_ID
     description: "应用 ID"
@@ -17,6 +20,18 @@ optional_env:
   - name: SHARECRM_BASE_URL
     description: "接口地址，留空则使用 https://open.fxiaoke.com"
     prompt: "Base URL (https://open.fxiaoke.com)"
+    password: false
+  - name: SHARECRM_SSE_VERSION
+    description: "SSE 协议版本，默认 1.4.0；低于 1.4.0 收不到图片/图文"
+    prompt: "SSE version (1.4.0)"
+    password: false
+  - name: SHARECRM_MAX_MESSAGE_LENGTH
+    description: "单条消息最大长度，默认 4096，超长自动分片"
+    prompt: "Max message length (4096)"
+    password: false
+  - name: SHARECRM_INCLUDE_HISTORY
+    description: "是否把群聊 history_messages 作为上下文注入，默认 true"
+    prompt: "Include history (true/false)"
     password: false
   - name: SHARECRM_ALLOWED_USERS
     description: "允许的用户 ID，逗号分隔（如 E.82846.1230）。留空则私聊走 pairing"

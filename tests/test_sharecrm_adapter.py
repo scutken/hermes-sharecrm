@@ -26,10 +26,30 @@ PLUGIN_DIR = Path(__file__).resolve().parents[1]
 if str(PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(PLUGIN_DIR))
 
+# 没有 hermes-agent 运行时就从 HERMES_AGENT_HOME / 本机默认安装位置找（不伪造 gateway）。
+# pytest 下 conftest.py 已经做过一次，这里兜底 unittest discover / 直接跑本文件。
 try:  # 这些测试依赖 hermes-agent 运行时
     import gateway  # noqa: F401
-except ImportError as exc:  # pragma: no cover
-    raise unittest.SkipTest("hermes-agent (gateway) is required to run these tests") from exc
+except ImportError as exc:
+    import os as _os
+
+    for _raw in (
+        _os.getenv("HERMES_AGENT_HOME") or "",
+        str(Path.home() / "AppData" / "Local" / "hermes" / "hermes-agent"),
+        str(Path.home() / ".hermes" / "hermes-agent"),
+    ):
+        if not _raw or not (Path(_raw) / "gateway" / "__init__.py").is_file():
+            continue
+        if _raw not in sys.path:
+            sys.path.insert(0, _raw)
+        try:
+            import gateway  # noqa: F401
+        except ImportError:
+            sys.path.remove(_raw)
+            continue
+        break
+    else:  # pragma: no cover
+        raise unittest.SkipTest("hermes-agent (gateway) is required to run these tests") from exc
 
 
 def _load_plugin():
@@ -130,6 +150,13 @@ class _FakeStreamResp:
 
     def __init__(self, lines):
         self.content = _FakeContent(lines)
+
+    # _sse_loop 用 ``async with session.get(...) as resp``，假响应也要支持
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
 
 
 class ConfigTests(unittest.TestCase):
@@ -266,6 +293,50 @@ class ParserTests(unittest.IsolatedAsyncioTestCase):
     async def test_server_retry_fallback_when_absent(self):
         a = _make_adapter()
         self.assertEqual(a._server_retry_seconds(1.0), 1.0)
+
+    async def test_sse_stream_end_logs_duration_and_reason(self):
+        """连接结束必须留一条带时长和原因的 INFO，62 秒断连才有据可查。"""
+        a = _make_adapter()
+        a._stop_event = asyncio.Event()
+
+        class _Sess:
+            def get(self, url, **kwargs):
+                return _FakeStreamResp([b"event: connected\n", b'data: {"type":"connected"}\n', b"\n"])
+
+        a._client_session = _Sess()
+        a._ensure_token = mock.AsyncMock(return_value=True)
+
+        async def _stop_after(_delay):
+            a._stop_event.set()
+
+        a._wait = _stop_after
+        with self.assertLogs(adapter.logger, level="INFO") as logs:
+            await a._sse_loop()
+        joined = "\n".join(logs.output)
+        self.assertIn("SSE stream ended after", joined)
+        self.assertIn("reason=eof", joined)
+
+    async def test_sse_connection_error_logs_duration_and_exception_type(self):
+        """网络层断要区分于 eof：日志里带异常类型和持续时长。"""
+        a = _make_adapter()
+        a._stop_event = asyncio.Event()
+
+        class _Sess:
+            def get(self, url, **kwargs):
+                raise asyncio.TimeoutError("sock read timeout")
+
+        a._client_session = _Sess()
+        a._ensure_token = mock.AsyncMock(return_value=True)
+
+        async def _stop_after(_delay):
+            a._stop_event.set()
+
+        a._wait = _stop_after
+        with self.assertLogs(adapter.logger, level="WARNING") as logs:
+            await a._sse_loop()
+        joined = "\n".join(logs.output)
+        self.assertIn("SSE connection error after", joined)
+        self.assertIn("TimeoutError", joined)
 
     async def test_dedup_drops_duplicate(self):
         a = _make_adapter()
@@ -465,6 +536,322 @@ class ParserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.message_type, MessageType.PHOTO)
         self.assertEqual(event.media_urls, ["/tmp/x.png"])
 
+class QuotedMessageTests(unittest.IsolatedAsyncioTestCase):
+    """被引用消息（quoted）：文本块、图片顺序与上限、不依赖 history 开关。"""
+
+    async def _run(self, data: dict, *, extra: dict | None = None, stage=None):
+        a = _make_adapter(extra)
+        captured = {}
+
+        async def _capture(event):
+            captured["event"] = event
+
+        a.handle_message = _capture
+        a._stage_images = mock.AsyncMock(
+            side_effect=stage or (lambda images, limit=adapter.MAX_INBOUND_IMAGES, timeout=None: [])
+        )
+        a._do_send = mock.AsyncMock(return_value={"success": True})
+        a._home_channel_set = lambda: True
+        payload = {"type": "message", "data": {
+            "message_id": data.pop("_message_id", "q1"),
+            "chat_id": data.pop("_chat_id", "0:fs:grp:"),
+            "chat_type": data.pop("_chat_type", "group"),
+            "from": {"id": "8017", "name": "张三"}, "ea": "fs",
+            **data,
+        }}
+        await a._handle_message(payload)
+        return a, captured["event"]
+
+    async def test_quoted_hit_renders_block_with_sender_and_time(self):
+        _, event = await self._run({
+            "message": {"type": "text", "content": "@二哈 看下这条"},
+            "reply_message_id": 111,
+            "quoted": {
+                "message_id": "111", "sender_id": "9001", "full_sender_id": "E.fs.9001",
+                "timestamp_ms": 1762500000000, "message_type": "T", "text": "服务器又挂了",
+                "images": [], "missing": False, "images_unavailable": False,
+            },
+            "history_messages": [
+                {"message_id": "111", "content": "服务器又挂了", "full_sender_id": "E.fs.9001", "message_timestamp": 1000},
+            ],
+        })
+        times = adapter.ShareCRMAdapter._quoted_time({"timestamp_ms": 1762500000000})
+        self.assertRegex(times, r"^\d{2}:\d{2}$")
+        self.assertIn("看下这条", event.text)
+        self.assertIn(f"[Quoted message · sender:9001 · {times}]", event.text)
+        self.assertIn("服务器又挂了", event.text)
+        self.assertEqual(event.reply_to_message_id, "111")
+        # 有 quoted 时不再重复塞 reply_to_text（同一段文本会看两遍）
+        self.assertIsNone(event.reply_to_text)
+        self.assertNotIn("/tmp", event.text)
+
+    async def test_quoted_missing_does_not_invent_content(self):
+        _, event = await self._run({
+            "message": {"type": "text", "content": "@二哈 回你"},
+            "reply_message_id": 222,
+            "history_messages": [
+                {"message_id": "222", "content": "历史里的旧内容", "sender_id": "E.fs.1", "message_timestamp": 1000},
+            ],
+            "quoted": {"message_id": "222", "missing": True},
+        })
+        self.assertIn("[Quoted message · id=222 · 超出可见范围]", event.text)
+        self.assertNotIn("历史里的旧内容", event.text)
+
+    async def test_quoted_images_unavailable_is_explicit(self):
+        _, event = await self._run({
+            "message": {"type": "text", "content": "@二哈 这张图"},
+            "quoted": {
+                "message_id": "333", "full_sender_id": "E.fs.9001", "timestamp_ms": 1762500000000,
+                "message_type": "I", "text": "", "images": [],
+                "missing": False, "images_unavailable": True,
+            },
+        })
+        self.assertIn("[Quoted message · sender:9001 ·", event.text)
+        self.assertIn("[引用的图片取不到]", event.text)
+        self.assertEqual(event.media_urls, [])
+        self.assertNotIn("其中图片", event.text)
+
+    async def test_no_quoted_keeps_old_shape(self):
+        _, event = await self._run({
+            "message": {"type": "text", "content": "普通消息"},
+            "reply_message_id": 111,
+            "history_messages": [
+                {"message_id": "111", "content": "你好", "full_sender_id": "E.fs.9001", "message_timestamp": 1000},
+            ],
+        })
+        self.assertEqual(event.text, "普通消息")
+        self.assertEqual(event.reply_to_text, "你好")
+        self.assertEqual(event.reply_to_message_id, "111")
+        self.assertNotIn("Quoted message", event.text)
+
+    async def test_quoted_images_go_after_current_and_capped_at_four(self):
+        def stage(images, limit=adapter.MAX_INBOUND_IMAGES, timeout=None):
+            return [(f"/tmp/{limit}-{i}.png", f"{i}.png") for i in range(min(len(images), limit))]
+
+        quoted_images = [{"url": f"https://x/q{i}.png", "filename": f"q{i}.png"} for i in range(6)]
+        a, event = await self._run({
+            "message": {"type": "text", "content": "@二哈 对比下", "images": [{"url": "https://x/cur.png", "filename": "cur.png"}]},
+            "quoted": {
+                "message_id": "444", "full_sender_id": "E.fs.9001", "timestamp_ms": 1762500000000,
+                "message_type": "MIX", "text": "六张图", "images": quoted_images,
+                "missing": False, "images_unavailable": False,
+            },
+        }, stage=stage)
+        calls = a._stage_images.await_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1].kwargs.get("limit"), adapter.MAX_QUOTED_IMAGES)
+        self.assertEqual(calls[1].kwargs.get("timeout"), adapter.QUOTED_IMAGE_TIMEOUT)
+        self.assertEqual(adapter.MAX_QUOTED_IMAGES, 4)
+        self.assertEqual(adapter.QUOTED_IMAGE_TIMEOUT, 5.0)
+        # 当前消息那条路不带 timeout，走默认 15s
+        self.assertNotIn("timeout", calls[0].kwargs)
+        self.assertEqual(event.media_urls, ["/tmp/8-0.png", "/tmp/4-0.png", "/tmp/4-1.png", "/tmp/4-2.png", "/tmp/4-3.png"])
+        self.assertEqual(len(event.media_types), len(event.media_urls))
+        self.assertIn("[其中图片 4 张]", event.text)
+        self.assertIn("六张图", event.text)
+
+    async def test_quoted_renders_even_when_history_disabled_and_in_dm(self):
+        _, event = await self._run({
+            "_chat_id": "0:fs:dm:", "_chat_type": "direct",
+            "message": {"type": "text", "content": "私聊里引用"},
+            "history_messages": [
+                {"message_id": "555", "content": "不该出现", "sender_id": "E.fs.1", "message_timestamp": 1000},
+            ],
+            "quoted": {
+                "message_id": "555", "full_sender_id": "E.fs.9001", "timestamp_ms": 1762500000000,
+                "message_type": "T", "text": "私聊被引用的正文", "images": [],
+                "missing": False, "images_unavailable": False,
+            },
+        }, extra={"include_history": False})
+        self.assertIsNone(event.channel_context)
+        self.assertIn("私聊被引用的正文", event.text)
+        self.assertNotIn("不该出现", event.text)
+
+    async def test_quoted_timestamp_seconds_and_iso_and_bad(self):
+        fmt = adapter.ShareCRMAdapter._quoted_time
+        # 契约主字段 timestamp_ms（毫秒），旧名 timestamp 仍是兼容路径
+        self.assertEqual(fmt({"timestamp_ms": 1762500000000}), fmt({"timestamp": 1762500000000}))
+        self.assertEqual(fmt({"timestamp_ms": 1762500000000}), fmt({"timestamp": 1762500000}))
+        self.assertEqual(fmt({"timestamp_ms": 1762500000000, "timestamp": 1}), fmt({"timestamp_ms": 1762500000000}))
+        self.assertTrue(fmt({"timestamp": "2026-11-20T13:05:00"}))
+        self.assertEqual(fmt({"timestamp": ""}), "")
+        self.assertEqual(fmt({"timestamp": "不是时间"}), "")
+        self.assertEqual(fmt({}), "")
+
+    async def test_quoted_mix_text_only_is_not_reported_as_missing_images(self):
+        # 网关侧（白泽拍板）MIX 只有文字时不给 images_unavailable；插件不能凭空说图取不到
+        _, event = await self._run({
+            "message": {"type": "text", "content": "@二哈 这段文字你怎么看"},
+            "quoted": {
+                "message_id": "888", "full_sender_id": "E.fs.9001", "timestamp_ms": 1762500000000,
+                "message_type": "MIX", "text": "只有文字的图文消息", "images": [],
+            },
+        })
+        self.assertIn("只有文字的图文消息", event.text)
+        self.assertNotIn("取不到", event.text)
+        self.assertNotIn("其中图片", event.text)
+        self.assertEqual(event.media_urls, [])
+
+    async def test_quoted_images_listed_but_none_downloaded_is_explicit(self):
+        _, event = await self._run({
+            "message": {"type": "text", "content": "@二哈 看"},
+            "quoted": {
+                "message_id": "666", "full_sender_id": "E.fs.9001", "timestamp_ms": 1762500000000,
+                "message_type": "I", "text": "", "images": [{"url": "https://x/a.png"}],
+                "missing": False, "images_unavailable": False,
+            },
+        })
+        self.assertIn("[引用的图片本次没取到]", event.text)
+
+    def test_format_quoted_plain_and_mix_and_doc(self):
+        fmt = adapter.ShareCRMAdapter._format_quoted
+        base = {"message_id": "1", "full_sender_id": "E.fs.9001", "timestamp_ms": 1762500000000}
+        clock = adapter.ShareCRMAdapter._quoted_time(base)
+        self.assertEqual(fmt({**base, "message_type": "T", "text": " 你好 "}), f"[Quoted message · sender:9001 · {clock}]\n你好")
+        mix = fmt({**base, "message_type": "MIX", "text": "图+文", "images": [{"url": "https://x/1.png"}]})
+        self.assertIn("图+文", mix)
+        self.assertNotIn("其中图片", mix)  # 计数行要靠真实下载结果，不在这里编
+        doc = fmt({**base, "message_type": "D", "text": ""})
+        self.assertIn("文档", doc)
+        doc_raw = fmt({**base, "message_type": "D", "text": "report.pdf"})
+        self.assertIn("report.pdf", doc_raw)
+        self.assertIn("原始内容", doc_raw)  # 别让模型把文档原始 content 当用户原话
+        self.assertEqual(fmt({}), "")
+        self.assertEqual(fmt(None), "")
+
+    async def test_quoted_without_any_sender_does_not_crash(self):
+        """full_sender_id 与 sender_id 都缺失时，表头不能崩、也不能编造发送人。
+
+        断言只盯「不崩 + 表头还在正文前面」，发送人位置具体是什么字面值是展示细节，
+        以后想从 ``?`` 改成「未知发送人」不应该让这条用例失败。
+        """
+        fmt = adapter.ShareCRMAdapter._format_quoted
+        base = {"message_id": "1", "timestamp_ms": 1762500000000, "message_type": "T", "text": "没有发送人"}
+        for quoted in (dict(base), {**base, "sender_id": "", "full_sender_id": ""},
+                       {**base, "sender_id": None, "full_sender_id": None}):
+            block = fmt(quoted)
+            self.assertIn("没有发送人", block)
+            first, _, rest = block.partition("\n")
+            self.assertTrue(first.startswith("[Quoted message · "), first)
+            self.assertTrue(first.endswith("]"), first)
+            # 表头里必须有一个「发送人」占位段，不能是空段或直接省略
+            middle = first[len("[Quoted message · "):-1]
+            self.assertTrue(middle.split(" · ")[0].strip(), first)
+            self.assertIn("没有发送人", rest)
+        # 整条消息路径也不崩
+        _, event = await self._run({
+            "message": {"type": "text", "content": "@二哈 看这条"},
+            "quoted": dict(base),
+        })
+        self.assertIn("没有发送人", event.text)
+        self.assertIn("[Quoted message · ", event.text)
+
+    async def test_quoted_empty_text_key_is_not_rendered(self):
+        """网关 NON_NULL 只挡 null，空串 "" 仍会下发；插件不能把它当正文渲染出一行空。
+
+        空正文时表头下面补一行「没有可读内容」（刘法克 2026-11-20 定的口径）：
+        引用这个事实要保留，但要说清没内容不是故障；不能出现空字符串行。
+        """
+        _, event = await self._run({
+            "message": {"type": "text", "content": "@二哈 这条"},
+            "quoted": {
+                "message_id": "999", "full_sender_id": "E.fs.9001", "timestamp_ms": 1762500000000,
+                "message_type": "T", "text": "", "images": [],
+            },
+        })
+        block = adapter.ShareCRMAdapter._format_quoted({
+            "message_id": "999", "full_sender_id": "E.fs.9001", "timestamp_ms": 1762500000000,
+            "message_type": "T", "text": "", "images": [],
+        })
+        lines = block.split("\n")
+        self.assertTrue(lines[0].startswith("[Quoted message · sender:9001 ·"), block)
+        # 没有空行、没有空正文行，只有一行说明
+        self.assertEqual(lines, [lines[0], "[被引用的消息没有可读内容]"])
+        self.assertNotIn("\n\n", event.text)
+
+    def test_quoted_without_readable_content_says_so(self):
+        """表头之后什么都没有时补说明；有图/D 文档时不能误加这句。"""
+        fmt = adapter.ShareCRMAdapter._format_quoted
+        base = {"message_id": "1", "full_sender_id": "E.fs.1230", "timestamp_ms": 1795164496000}
+        empty = fmt({**base, "message_type": "T", "text": "", "images": []})
+        self.assertIn("[被引用的消息没有可读内容]", empty)
+        # 有正文：不加
+        self.assertNotIn("[被引用的消息没有可读内容]", fmt({**base, "message_type": "T", "text": "111", "images": []}))
+        # 有图：由 _quoted_image_note 负责，这里不能抢话
+        self.assertNotIn("[被引用的消息没有可读内容]", fmt({**base, "message_type": "MIX", "text": "", "images": [{"url": "https://x/1.png"}]}))
+        # 纯图 I：同上，图片说明归 note
+        self.assertNotIn("[被引用的消息没有可读内容]", fmt({**base, "message_type": "I", "text": "", "images": []}))
+        # D 文档：用专门的文案，不混用
+        doc = fmt({**base, "message_type": "D", "text": "", "images": []})
+        self.assertIn("文档/文件消息", doc)
+        self.assertNotIn("[被引用的消息没有可读内容]", doc)
+
+    async def test_quoted_images_total_beyond_staged_is_disclosed(self):
+        def stage(images, limit=adapter.MAX_INBOUND_IMAGES, timeout=None):
+            return [(f"/tmp/q{i}.png", f"q{i}.png") for i in range(min(len(images), limit))]
+
+        _, event = await self._run({
+            "message": {"type": "text", "content": "@二哈 看引用"},
+            "quoted": {
+                "message_id": "777", "full_sender_id": "E.fs.9001", "timestamp_ms": 1762500000000,
+                "message_type": "I", "text": "",
+                "images": [{"url": f"https://x/q{i}.png"} for i in range(4)],
+                "images_total": 6, "missing": False, "images_unavailable": False,
+            },
+        }, stage=stage)
+        self.assertIn("[其中图片 4 张][共 6 张，仅取到 4 张]", event.text)
+        self.assertEqual(len(event.media_urls), 4)
+
+    async def test_quoted_image_batch_times_out_without_raising(self):
+        """引用图整批卡住时：到总上限就放弃、返回空、不抛异常、日志可分辨。"""
+        a = _make_adapter()
+        started = asyncio.Event()
+        released = []
+
+        async def _hang(images, limit=adapter.MAX_INBOUND_IMAGES, timeout=None):
+            started.set()
+            try:
+                await asyncio.sleep(60)  # 模拟文件服务卡住不返回
+            except asyncio.CancelledError:
+                released.append(True)
+                raise
+            return [("/tmp/never.png", "never.png")]
+
+        current = asyncio.ensure_future(a._stage_images([]))
+        quoted = asyncio.ensure_future(_hang([{"url": "https://x/a.png"}]))
+        with mock.patch.object(adapter, "QUOTED_IMAGES_TOTAL_TIMEOUT", 0.05), \
+                self.assertLogs(adapter.logger, level="WARNING") as logs:
+            staged, quoted_staged = await a._join_quoted_batch(current, quoted)
+        self.assertEqual(quoted_staged, [])
+        self.assertEqual(staged, [])
+        self.assertTrue(started.is_set())
+        self.assertEqual(released, [True])  # 被取消，不是留着的僵尸任务
+        self.assertTrue(quoted.cancelled() or quoted.done())
+        self.assertTrue(any("quoted image batch timeout" in line for line in logs.output))
+
+    async def test_quoted_batch_timeout_does_not_cut_current_attachment(self):
+        """总上限只作用于引用图；当前消息的图再慢也要等它下完，不能被一起取消。"""
+        a = _make_adapter()
+        slow_started = asyncio.Event()
+
+        async def _slow_current(images, limit=adapter.MAX_INBOUND_IMAGES, timeout=None):
+            slow_started.set()
+            await asyncio.sleep(0.15)  # 超过引用图总上限（0.05s），但在自己的 15s 之内
+            return [("/tmp/cur.png", "cur.png")]
+
+        async def _hang(images, limit=adapter.MAX_INBOUND_IMAGES, timeout=None):
+            await asyncio.sleep(60)
+            return []
+
+        current = asyncio.ensure_future(_slow_current([]))
+        quoted = asyncio.ensure_future(_hang([]))
+        with mock.patch.object(adapter, "QUOTED_IMAGES_TOTAL_TIMEOUT", 0.05), \
+                self.assertLogs(adapter.logger, level="WARNING"):
+            staged, quoted_staged = await a._join_quoted_batch(current, quoted)
+        self.assertTrue(slow_started.is_set())
+        self.assertEqual(staged, [("/tmp/cur.png", "cur.png")])
+        self.assertEqual(quoted_staged, [])
+
     async def test_get_chat_info_unseen_is_dm_fallback(self):
         a = _make_adapter()
         info = await a.get_chat_info("0:fs:abcdef1234567890:")
@@ -562,6 +949,77 @@ class ParserTests(unittest.IsolatedAsyncioTestCase):
             result = await a._do_send("0:fs:grp:", "hi")
         self.assertTrue(result["success"])
         self.assertGreater(a._last_self_ts.get("0:fs:grp:", 0), 0)
+
+
+class _FakeImageResp:
+    """单张图片下载的假响应：只实现 _stage_images 用到的 status / read。"""
+
+    def __init__(self, status: int = 200, body: bytes = b"img"):
+        self.status = status
+        self._body = body
+
+    async def read(self):
+        return self._body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeImageSession:
+    """按调用顺序返回预置响应，并记录每次 get 的 url 与 timeout。"""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        resp = self._responses[min(len(self.calls) - 1, len(self._responses) - 1)]
+        if isinstance(resp, Exception):
+            raise resp
+        return resp
+
+
+class ImageStagingLogTests(unittest.IsolatedAsyncioTestCase):
+    """图片下载耗时日志：只在 debug 级，且不改动下载结果。"""
+
+    async def test_single_and_batch_timing_logged_without_changing_result(self):
+        a = _make_adapter()
+        session = _FakeImageSession([_FakeImageResp(200), _FakeImageResp(403)])
+        a._client_session = session
+        a._cache_image = mock.AsyncMock(return_value="/tmp/ok.png")
+        images = [
+            {"url": "https://x/a.png", "filename": "a.png"},
+            {"url": "https://x/b.png", "filename": "b.png"},
+        ]
+        with self.assertLogs(adapter.logger, level="DEBUG") as logs:
+            staged = await a._stage_images(images)
+        # 行为不变：成功的进 media，403 的跳过
+        self.assertEqual(staged, [("/tmp/ok.png", "a.png")])
+        self.assertEqual(len(session.calls), 2)
+        joined = "\n".join(logs.output)
+        self.assertIn("inbound image single took", joined)
+        self.assertIn("inbound image batch took", joined)
+        self.assertIn("outcome=downloaded", joined)
+        self.assertIn("outcome=status403", joined)
+        self.assertIn("tried=2", joined)
+        self.assertIn("staged=1", joined)
+        # 超时值带在日志里，真机能分清走的是 15s（当前消息）还是 5s（引用图）
+        self.assertIn("timeout=15.0s", joined)
+
+    async def test_quoted_path_logs_its_own_timeout(self):
+        a = _make_adapter()
+        a._client_session = _FakeImageSession([_FakeImageResp(200)])
+        a._cache_image = mock.AsyncMock(return_value="/tmp/q.png")
+        with self.assertLogs(adapter.logger, level="DEBUG") as logs:
+            staged = await a._fetch_quoted_images([{"url": "https://x/q.png", "filename": "q.png"}])
+        self.assertEqual(staged, [("/tmp/q.png", "q.png")])
+        joined = "\n".join(logs.output)
+        self.assertIn("timeout=5.0s", joined)
+        self.assertIn("limit=4", joined)
 
 
 class HttpTests(unittest.IsolatedAsyncioTestCase):

@@ -97,6 +97,15 @@ ERR_BOT_NOT_CONNECTED = 50001
 ERR_INTERNAL = 50000
 MAX_INBOUND_IMAGES = 8
 MAX_INBOUND_IMAGE_BYTES = 10 * 1024 * 1024
+# 单张图片下载超时（秒）：当前消息的图沿用原来的 15s，引用图压到 5s，
+# 避免一张慢图把首条 ACK/回复拖到十几秒（刘法克 2026-11-20 提的超时风险）
+INBOUND_IMAGE_TIMEOUT = 15.0
+QUOTED_IMAGE_TIMEOUT = 5.0
+# 引用图整批的总上限（秒）：批内是串行 await，单张超时压不住总时长，
+# 首条 ACK 最坏要晚这么久，超过就整批放弃（白泽 2026-11-20 拍板）
+QUOTED_IMAGES_TOTAL_TIMEOUT = 5.0
+# 引用消息里的图片最多下载几张（网关侧同样只签 4 个 URL，两边保持一致）
+MAX_QUOTED_IMAGES = 4
 HISTORY_LIMIT = 12
 HISTORY_MAX_CHARS = 4000
 HISTORY_HEADER = "[Recent channel messages]"
@@ -358,6 +367,8 @@ class ShareCRMAdapter(BasePlatformAdapter):
             if self._last_event_id:
                 headers["Last-Event-ID"] = self._last_event_id
             reason = "eof"
+            # 本次尝试的开始时间：异常分支里没有 resp，也要能算出持续多久
+            attempt_started = time.monotonic()
             self._sse_online.clear()
             # SSE 是长连接：不能用会按总时长计时的 total 超时，否则会被客户端
             # 按时长掐断。用 sock_read 兜底空闲（服务端有心跳，正常不会触发）。
@@ -376,16 +387,34 @@ class ShareCRMAdapter(BasePlatformAdapter):
                         continue
                     fallback = 1.0
                     reason = await self._read_stream(resp)
+                    # 连接持续时长 + 结束原因：排查 60/62 秒断连时用来分清
+                    # 「服务端主动关」（reset/stopped）与「服务端正常结束流」（eof）
+                    logger.info(
+                        "ShareCRM: SSE stream ended after %.1fs (reason=%s, last_event_id=%s)",
+                        time.monotonic() - attempt_started,
+                        reason,
+                        self._last_event_id or "-",
+                    )
             except asyncio.CancelledError:
                 raise
             except (aiohttp.ClientError if aiohttp else Exception, asyncio.TimeoutError) as exc:
-                logger.warning("ShareCRM: SSE connection error — %s", exc)
+                logger.warning(
+                    "ShareCRM: SSE connection error after %.1fs — %s: %s",
+                    time.monotonic() - attempt_started,
+                    type(exc).__name__,
+                    exc,
+                )
                 await self._wait(fallback)
                 fallback = min(fallback * 2, 60.0)
                 continue
             except Exception as exc:
                 # 服务端可能在 max_lifetime 到期后正常关闭流，这里按普通断开处理
-                logger.debug("ShareCRM: SSE stream ended — %s", exc)
+                logger.warning(
+                    "ShareCRM: SSE stream aborted after %.1fs — %s: %s",
+                    time.monotonic() - attempt_started,
+                    type(exc).__name__,
+                    exc,
+                )
                 await self._wait(fallback)
                 fallback = min(fallback * 2, 60.0)
                 continue
@@ -508,11 +537,44 @@ class ShareCRMAdapter(BasePlatformAdapter):
         # 否则 /new、/reset 等命令不在 char 0，gateway 识别不到。私聊不处理。
         if chat_type != "dm":
             caption = self._strip_mention(caption)
-        staged = await self._stage_images(msg.get("images") or [])
-        image_lines = [f"![{name}]({path})" for path, name in staged]
-        text = "\n".join(part for part in [caption, *image_lines] if part)
         reply_to_id = d.get("reply_message_id")
         history = d.get("history_messages") or []
+
+        # 被引用的消息（网关新增 quoted）：是本条消息的一部分，不受
+        # SHARECRM_INCLUDE_HISTORY 开关影响，私聊群聊都要渲染。
+        # 图片有界（默认最多 4 张），排在当前消息的图之后，让 agent 第一轮就看得到。
+        quoted = d.get("quoted") or {}
+        if not isinstance(quoted, dict):
+            quoted = {}
+        quoted_images = quoted.get("images") or []
+        fetch_quoted_images = bool(
+            quoted and not quoted.get("missing") and not quoted.get("images_unavailable") and quoted_images
+        )
+        # 当前消息的图与引用图并发下载：串行时最坏要等 9×(单片 15s) 才发 ACK，
+        # 真机上文件服务一慢首条回复就会拖很久（刘法克 2026-11-20 的稳定性风险）。
+        # 注意 gather/wait 只让「两批」并发，批内的 for 循环仍是串行 await，单张超时
+        # 压不住总时长；所以只给引用图那批套总上限（白泽 2026-11-20 拍板）。
+        # 当前消息那批保持原行为：没有总超时，单张 15s。
+        if fetch_quoted_images:
+            current_task = asyncio.ensure_future(self._stage_images(msg.get("images") or []))
+            quoted_task = asyncio.ensure_future(self._fetch_quoted_images(quoted_images))
+            staged, quoted_staged = await self._join_quoted_batch(current_task, quoted_task)
+        else:
+            staged = await self._stage_images(msg.get("images") or [])
+            quoted_staged: List[Tuple[str, str]] = []
+        quoted_block = self._format_quoted(quoted) if quoted else ""
+        if quoted_block:
+            noted = [quoted_block]
+            note = self._quoted_image_note(quoted, quoted_staged)
+            if note:
+                noted.append(note)
+            quoted_block = "\n".join(noted)
+
+        image_lines = [f"![{name}]({path})" for path, name in staged]
+        parts = [caption, *image_lines]
+        if quoted_block:
+            parts.append(quoted_block)
+        text = "\n".join(part for part in parts if part)
 
         # 历史上下文（官方 channel_context 路径）：
         # - 只在非私聊注入（私聊每条都触发，无需 backfill；对齐 Discord/Slack/Relay）
@@ -523,6 +585,11 @@ class ShareCRMAdapter(BasePlatformAdapter):
             since_ms = self._last_self_ts.get(chat_id)
             channel_context = self._format_history(history, since_ms=since_ms)
         reply_text = self._find_reply_text(history, reply_to_id)
+        if quoted_block:
+            # 有 quoted 时它就是这条回复的权威内容（且已进正文块），history 里那份是
+            # 同一段文本、媒体消息还会被网关换成 "[image omitted]"。再塞 reply_to_text
+            # 会让模型看两遍，所以只保留 reply_to_message_id，文本交给 quoted。
+            reply_text = None
 
         # 拦截 /sethome，用官方 persist_home_channel 落库（不再直写 os.environ）
         if caption.strip() == "/sethome":
@@ -534,7 +601,7 @@ class ShareCRMAdapter(BasePlatformAdapter):
         if chat_type == "dm" and chat_id and not self._home_channel_set():
             self._set_home_channel(chat_id)
 
-        if chat_id and (caption or staged):
+        if chat_id and (caption or staged or quoted_block):
             try:
                 await self._do_send(chat_id, ACK_TEXT)
             except Exception as exc:
@@ -544,6 +611,7 @@ class ShareCRMAdapter(BasePlatformAdapter):
             chat_id=chat_id, chat_name=chat_name, chat_type=chat_type,
             user_id=user_id, user_name=user_name,
         )
+        all_staged = [*staged, *quoted_staged]
         event_kwargs: Dict[str, Any] = {
             "text": text,
             "message_type": MessageType.PHOTO if staged and not caption else MessageType.TEXT,
@@ -554,9 +622,10 @@ class ShareCRMAdapter(BasePlatformAdapter):
             "timestamp": self._event_time(d),
             "channel_context": channel_context or None,
         }
-        if staged:
-            event_kwargs["media_urls"] = [path for path, _ in staged]
-            event_kwargs["media_types"] = [_guess_image_mime(name) for _, name in staged]
+        if all_staged:
+            # 顺序：当前消息的图在前，引用图在后；media_types 同步对齐
+            event_kwargs["media_urls"] = [path for path, _ in all_staged]
+            event_kwargs["media_types"] = [_guess_image_mime(name) for _, name in all_staged]
         event = self._build_event(event_kwargs)
         await self.handle_message(event)
 
@@ -693,11 +762,166 @@ class ShareCRMAdapter(BasePlatformAdapter):
                 return item.get("content") or None
         return None
 
-    async def _stage_images(self, images: List[Any]) -> List[Tuple[str, str]]:
+    @staticmethod
+    def _quoted_time(quoted: dict) -> str:
+        """把 quoted 的时间戳格式化成 ``HH:MM``。
+
+        契约（白泽 2026-11-20 拍板）：主字段是 ``timestamp_ms``，毫秒原值。
+        兼容旧名 ``timestamp``（同一毫秒语义），秒级数值与 ISO 字符串也认，
+        解析不出来返回空串（表头就不带时间）。
+        """
+        raw = quoted.get("timestamp_ms")
+        if raw in (None, "", 0, "0"):
+            raw = quoted.get("timestamp")
+        dt: Optional[datetime] = None
+        if isinstance(raw, str):
+            text = raw.strip()
+            if text.isdigit():
+                raw = int(text)
+            else:
+                try:
+                    dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                except ValueError:
+                    dt = None
+        if dt is None and isinstance(raw, (int, float)) and raw > 0:
+            value = float(raw)
+            # < 1e11 视为秒（1e11 秒已是公元 5138 年，13 位毫秒必然更大）
+            if value < 1e11:
+                value *= 1000.0
+            try:
+                dt = datetime.fromtimestamp(value / 1000.0)
+            except (OverflowError, OSError, ValueError):
+                dt = None
+        return dt.strftime("%H:%M") if dt else ""
+
+    @classmethod
+    def _format_quoted(cls, quoted: dict) -> str:
+        """把网关下发的 ``quoted`` 渲染成一块明确的「被引用消息」文本。
+
+        只描述网关给的事实，不猜内容：
+
+        - ``missing``：history 里没命中（超出可见范围），只回 id，不编正文
+        - ``images_unavailable``：引用的图片取不到（未签名/签名失败），明说
+        - 正常：``[Quoted message · sender:<发送人短 id> · <HH:MM>]`` + 正文
+        - 引用的是文档/文件消息（message_type=D）时，网关回的是原始 content，
+          要标出来别让模型把它当用户说的话
+        - 图片计数行由 ``_quoted_image_note`` 负责（要等真正下载完才知道几张）
+
+        表头第二个位置一律带标签：正常是 ``sender:<短 id>``，超窗是 ``id=<消息 id>``。
+        两个分支同一个位置放不同东西时，模型很容易把发送人 ``1230`` 当成消息编号
+        （刘法克 2026-11-20 指出）。
+
+        表头之后没有任何实质内容时补一行 ``[被引用的消息没有可读内容]``：引用这个事实
+        本身要保留（谁、几点），但必须说清「没内容是正常的」，否则模型会以为内容丢了
+        （刘法克 2026-11-20 定的口径，比整块不渲染更好）。
+
+        网关侧语义对齐（刘法克提的）：``missing`` 只表示 history 没命中；命中但提不出
+        可读内容（如 D 文档）不算 missing，用 message_type 表达。
+        """
+        if not isinstance(quoted, dict) or not quoted:
+            return ""
+        quoted_id = str(quoted.get("message_id") or "").strip()
+        if quoted.get("missing"):
+            return f"[Quoted message · id={quoted_id or '?'} · 超出可见范围]"
+        sender = cls._short_sender(str(quoted.get("full_sender_id") or quoted.get("sender_id") or ""))
+        clock = cls._quoted_time(quoted)
+        head = f"sender:{sender}"
+        lines = [f"[Quoted message · {head} · {clock}]" if clock else f"[Quoted message · {head}]"]
+        message_type = str(quoted.get("message_type") or "").strip().upper()
+        body = str(quoted.get("text") or "").strip()
+        if body:
+            lines.append(f"{body}（文档/文件原始内容）" if message_type == "D" else body)
+        if quoted.get("images_unavailable"):
+            lines.append("[引用的图片取不到]")
+        elif message_type == "D" and not body:
+            # 引用的文档/文件消息：网关取不到可读正文，明说，不让模型瞎猜
+            lines.append("[被引用的是文档/文件消息，没有可读正文]")
+        elif not body and not quoted.get("images") and message_type != "I":
+            # 表头之后什么都没有：保留引用事实，同时说清没内容不是故障。
+            # 白泽 2026-11-20 复核后定：长句比 `(无正文)` 更清楚，别再改短
+            lines.append("[被引用的消息没有可读内容]")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _quoted_image_note(quoted: dict, staged: List[Tuple[str, str]]) -> str:
+        """引用图的一行说明：够不到就明说，够得到就报实际取到几张。
+
+        - ``images_unavailable`` 已在 ``_format_quoted`` 里明说，这里不重复
+        - 下载成功 N 张 → ``[其中图片 N 张]``；网关给了 ``images_total``（被引用
+          消息实际有几张）且大于 N 时补一句，避免最多只签/只下 4 张时模型以为
+          对方就发了 N 张
+        - 网关列了图/纯图片消息但一张都没下下来 → 明说没取到，别让模型以为没图
+        """
+        if not isinstance(quoted, dict) or quoted.get("missing") or quoted.get("images_unavailable"):
+            return ""
+        if staged:
+            note = f"[其中图片 {len(staged)} 张]"
+            total = _coerce_int(quoted.get("images_total"), 0)
+            if total > len(staged):
+                # 部分签名失败时 url=null 的占位也占位置，所以只能说「取到 N 张」，
+                # 不能说「前 N 张」（刘法克 2026-11-20 指出的措辞）
+                note += f"[共 {total} 张，仅取到 {len(staged)} 张]"
+            return note
+        message_type = str(quoted.get("message_type") or "").strip().upper()
+        listed = len(quoted.get("images") or [])
+        if message_type == "I" or listed:
+            return "[引用的图片本次没取到]"
+        return ""
+
+    async def _fetch_quoted_images(self, images: List[Any]) -> List[Tuple[str, str]]:
+        """引用图那批：张数有界（``MAX_QUOTED_IMAGES``），单张 5s。总上限由调用方套。"""
+        return await self._stage_images(images, limit=MAX_QUOTED_IMAGES, timeout=QUOTED_IMAGE_TIMEOUT)
+
+    async def _join_quoted_batch(
+        self,
+        current_task: "asyncio.Future",
+        quoted_task: "asyncio.Future",
+    ) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+        """等两批下载，只给引用图那批套总上限（``QUOTED_IMAGES_TOTAL_TIMEOUT``）。
+
+        - ``asyncio.wait`` 只让「两批」并发，批内仍是串行 await，单张超时压不住总时长，
+          所以引用图整批必须在外面再兜一个总超时。
+        - 当前消息那批**没有**总超时（保持原行为，单张 15s），它慢就等它。
+        - 引用图超时：取消该批（连带 ``session.get`` 的连接释放），日志打一句
+          ``quoted image batch timeout``，按「没取到」返回空列表，绝不抛异常——
+          真机排查时要能一眼分清是超时还是 403。
+        """
+        done, _pending = await asyncio.wait({quoted_task}, timeout=QUOTED_IMAGES_TOTAL_TIMEOUT)
+        if quoted_task in done:
+            quoted_staged = quoted_task.result()
+        else:
+            quoted_task.cancel()
+            logger.warning(
+                "ShareCRM: quoted image batch timeout after %ss, treated as unavailable",
+                QUOTED_IMAGES_TOTAL_TIMEOUT,
+            )
+            # 吞掉 CancelledError，等连接真正收尾，避免留下僵尸 task
+            await asyncio.gather(quoted_task, return_exceptions=True)
+            quoted_staged = []
+        # 当前消息那批照常等完（它会自己按单张 15s 超时收尾）
+        staged = await current_task
+        return staged, quoted_staged
+
+    async def _stage_images(
+        self,
+        images: List[Any],
+        limit: int = MAX_INBOUND_IMAGES,
+        timeout: float = INBOUND_IMAGE_TIMEOUT,
+    ) -> List[Tuple[str, str]]:
+        """下载图片到本地缓存，返回 ``[(本地路径, 文件名)]``。
+
+        ``limit`` 控制最多下载几张：入站消息用默认的 ``MAX_INBOUND_IMAGES``，
+        引用消息用 ``MAX_QUOTED_IMAGES``（有界，避免被一条引用拖住首轮响应）。
+        ``timeout`` 是单张下载的总超时（秒）：入站消息用 15s，引用图那条路传
+        ``QUOTED_IMAGE_TIMEOUT``（5s）——并发只压掉串行部分，超时本身还得压小，
+        否则真机文件服务一慢，首条回复仍会被一张引用图拖住。
+        """
         staged: List[Tuple[str, str]] = []
         if not self._client_session or not images:
             return staged
-        for image in images[:MAX_INBOUND_IMAGES]:
+        batch_started = time.monotonic()
+        attempts = 0
+        for image in images[:limit]:
             if not isinstance(image, dict):
                 continue
             url = str(image.get("url") or "").strip()
@@ -706,24 +930,47 @@ class ShareCRMAdapter(BasePlatformAdapter):
             if not self._is_public_image_url(url):
                 logger.warning("ShareCRM: skip inbound image from non-public host")
                 continue
+            attempts += 1
             name = os.path.basename(str(image.get("filename") or "image.png").replace("\\", "/")) or "image.png"
+            single_started = time.monotonic()
+            outcome = "downloaded"
             try:
                 async with self._client_session.get(
-                    url, timeout=aiohttp.ClientTimeout(total=15), allow_redirects=True
+                    url, timeout=aiohttp.ClientTimeout(total=timeout), allow_redirects=True
                 ) as resp:
-                    if resp.status >= 400:
-                        logger.warning("ShareCRM: inbound image download failed status=%s", resp.status)
-                        continue
-                    data = await resp.read()
+                    status = resp.status
+                    if status >= 400:
+                        outcome = f"status{status}"
+                        logger.warning("ShareCRM: inbound image download failed status=%s", status)
+                    else:
+                        data = await resp.read()
             except Exception as exc:
+                outcome = type(exc).__name__
                 logger.warning("ShareCRM: inbound image download failed: %s", exc)
-                continue
+            finally:
+                # 只记耗时和分类，不改输出内容；真机排查时用来分清「慢」「403」「排队超时」
+                logger.debug(
+                    "ShareCRM: inbound image single took %.0fms (timeout=%ss, outcome=%s)",
+                    (time.monotonic() - single_started) * 1000.0,
+                    timeout,
+                    outcome,
+                )
+            if outcome != "downloaded":
+                continue  # 状态码失败或异常，已在上面的分支打过 warning
             if not data or len(data) > MAX_INBOUND_IMAGE_BYTES:
                 logger.warning("ShareCRM: inbound image empty or too large")
                 continue
             path = await self._cache_image(data, name)
             if path:
                 staged.append((path, name))
+        logger.debug(
+            "ShareCRM: inbound image batch took %.0fms (tried=%d staged=%d limit=%s timeout=%ss)",
+            (time.monotonic() - batch_started) * 1000.0,
+            attempts,
+            len(staged),
+            limit,
+            timeout,
+        )
         return staged
 
     async def _cache_image(self, data: bytes, name: str) -> Optional[str]:

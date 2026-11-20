@@ -207,6 +207,40 @@ python -m pytest tests/ -q
 python -m unittest discover -s tests -v
 ```
 
+没有把 `hermes-agent` 装进当前解释器时，`tests/conftest.py`（pytest）和用例文件顶部
+（unittest）会按 `HERMES_AGENT_HOME` → `~/AppData/Local/hermes/hermes-agent` →
+`~/.hermes/hermes-agent` 的顺序找运行时仓库并加到 `sys.path`；都找不到时用例整体
+SkipTest，不会伪造 `gateway`。例如：
+
+```bash
+HERMES_AGENT_HOME=/path/to/hermes-agent python -m pytest tests/ -q
+```
+
+## 引用消息（quoted）
+
+网关在 SSE `message` 事件里下发 `quoted`（可选）：
+
+```json
+{
+  "message_id": "123", "sender_id": "9001", "full_sender_id": "E.fs.9001",
+  "timestamp_ms": 1762500000000, "message_type": "T", "text": "被引用的正文",
+  "images": [{"url": "https://...", "filename": "a.png", "width": 1, "height": 1, "size": 1}],
+  "images_total": 1, "missing": false, "images_unavailable": false
+}
+```
+
+插件的行为：
+
+- 正文里追加一块 `[Quoted message · <发送人短 id> · <HH:MM>]` + 正文；有图时补一行
+  `[其中图片 N 张]`（N 是真正下载成功的张数，块里不写本地路径）。
+- `missing: true` → `[Quoted message · id=<id> · 超出可见范围]`，不编内容。
+- `images_unavailable: true` → 块里明说「引用的图片取不到」。
+- 引用图下载进 `media_urls`，排在当前消息的图之后，`media_types` 同步；最多
+  `MAX_QUOTED_IMAGES`（4）张。
+- 不受 `SHARECRM_INCLUDE_HISTORY` 开关影响，私聊/群聊都会渲染；此时
+  `reply_to_message_id` 保留，`reply_to_text` 置空（文本已在 quoted 块里，避免重复）。
+- 时间戳主字段是 `timestamp_ms`（毫秒）；兼容旧名 `timestamp`，也兼容秒级与 ISO 字符串；解析失败时表头不带时间。
+
 ## 兼容性
 
 插件同时兼容新旧 Hermes 运行时：

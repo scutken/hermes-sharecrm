@@ -85,7 +85,7 @@ except ImportError:
     aiohttp = None
 
 DEFAULT_BASE_URL = "https://open.fxiaoke.com"
-DEFAULT_SSE_VERSION = "1.4.0"
+DEFAULT_SSE_VERSION = "1.5.0"
 TOKEN_BUFFER_SECONDS = 300
 TOKEN_MAX_RETRIES = 3  # 首次之外最多重试 3 次（1s/2s/4s + jitter，见文档 §12.2）
 TOKEN_RETRY_JITTER = 0.2
@@ -1271,7 +1271,7 @@ _DASHBOARD_ENV = (
     },
     {
         "name": "SHARECRM_SSE_VERSION",
-        "description": f"SSE 协议版本，默认 {DEFAULT_SSE_VERSION}；<1.4.0 收不到图片/图文",
+        "description": f"SSE 协议版本，默认 {DEFAULT_SSE_VERSION}；<1.4.0 收不到图片/图文，<1.5.0 不认引用块（quoted）",
         "prompt": f"SSE version ({DEFAULT_SSE_VERSION})",
         "help": "建议保持默认 1.4.0。",
     },
